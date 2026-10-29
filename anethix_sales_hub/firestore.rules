@@ -1,0 +1,293 @@
+rules_version = '2';
+
+// Anethix Sales Hub — Firestore security rules.
+//
+// Roles come from the caller's own `users/{uid}` document, so every profile
+// document is the source of truth for what its owner may do. That makes two
+// fields load-bearing and therefore locked below: `role` and `managerId`. A
+// user who could raise their own role could grant themselves everything else.
+//
+// ── READ vs WRITE ──────────────────────────────────────────────────────────
+// Reads are granted to any signed-in member of the workspace. This is a
+// deliberate choice, not laxness: the leaderboard is computed on the client
+// (lib/data/repositories/leaderboard_repository.dart) by fanning out over the
+// whole team's users, leads, callLogs and followUps, and the manager screens
+// list their team's attendance and activity. Rules cannot scope a *list*
+// query per document — a get()-based team-membership check inside a read rule
+// fails the entire query — so scoping those reads at the rules level would
+// break every screen that shows aggregate data.
+//
+// Writes stay locked exactly as they were: nobody writes another user's data,
+// nobody sets their own `role`, `managerId` or `isActive`, and `score` is
+// never client-written at all.
+//
+// ── FIRST-RUN BOOTSTRAP ────────────────────────────────────────────────────
+// While `users` is empty nobody can be identified as an admin, so the very
+// first admin profile cannot be written under these rules. To seed it (see
+// lib/data/firebase/firestore_seeder.dart), temporarily add this clause inside
+// `match /users/{userId}`:
+//
+//     allow create: if isSignedIn() && request.auth.uid == userId;
+//
+// publish, run the seeder once, then REMOVE the clause and publish again.
+// ───────────────────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ------------------------------ Helpers ------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function profile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasProfile() {
+      return isSignedIn() &&
+             exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function role() {
+      return profile().role;
+    }
+
+    function isAdmin() {
+      return hasProfile() && role() == 'admin';
+    }
+
+    function isManager() {
+      return hasProfile() && role() == 'manager';
+    }
+
+    function isEmployee() {
+      return hasProfile() && role() == 'employee';
+    }
+
+    // An active account is required for every write, so a deactivated user
+    // cannot keep working offline-first.
+    function isActive() {
+      return hasProfile() && profile().isActive == true;
+    }
+
+    function isSelf(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // True when `employeeId` reports to the caller. Used by write rules only —
+    // never inside a read rule, because the get() breaks list queries.
+    function managesEmployee(employeeId) {
+      return isManager() &&
+             exists(/databases/$(database)/documents/users/$(employeeId)) &&
+             get(/databases/$(database)/documents/users/$(employeeId)).data.managerId
+               == request.auth.uid;
+    }
+
+    // The fields on an existing document that this write leaves unchanged.
+    function unchanged(field) {
+      return !(field in request.resource.data) ||
+             request.resource.data[field] == resource.data[field];
+    }
+
+    // -------------------------------- users --------------------------------
+    //
+    // Any signed-in member reads profiles: employees resolve their manager and
+    // their teammates for the ranking screen, managers list their team, admins
+    // list everyone.
+    //
+    // Accounts are created and deactivated by an admin only — nobody
+    // provisions themselves. A user may edit their own name, phone and avatar.
+    // They may NOT touch `role`, `managerId`, `isActive`, `score` or `email`:
+    // role and managerId decide what these rules allow, isActive is an admin
+    // action, and `score` is never client-written at all (the leaderboard is
+    // computed from the underlying records).
+
+    match /users/{userId} {
+      allow read: if isSignedIn();
+
+      allow create: if isAdmin();
+
+      allow update: if isAdmin() ||
+                       (isSelf(userId) && isActive() &&
+                        unchanged('role') &&
+                        unchanged('managerId') &&
+                        unchanged('isActive') &&
+                        unchanged('email') &&
+                        unchanged('score') &&
+                        unchanged('createdAt'));
+
+      // Accounts are deactivated (isActive = false), never deleted, so the
+      // records that point at them keep resolving.
+      allow delete: if false;
+    }
+
+    // -------------------------------- leads --------------------------------
+    //
+    // A claim is the one write an employee makes to an unassigned lead, and it
+    // may only assign the lead to themselves — which is what stops a rep
+    // claiming a lead on behalf of someone else, or stealing one already taken.
+    //
+    // A MANAGER, by contrast, may set `assignedEmployeeId` to any uid on a lead
+    // they own (see managesLead below), which is what direct assignment needs:
+    // status -> claimed, assignedEmployeeId, claimedAt, publishedBy and
+    // publishedAt written in one batch. Manager updates carry no field-level
+    // restrictions, so no extra allowance is required for those fields — the
+    // gate is ownership of the lead, not the shape of the write.
+
+    function ownsLead() {
+      return resource.data.assignedEmployeeId == request.auth.uid;
+    }
+
+    function managesLead() {
+      return isManager() && (
+        resource.data.createdBy == request.auth.uid ||
+        resource.data.publishedBy == request.auth.uid ||
+        (resource.data.assignedEmployeeId != null &&
+         managesEmployee(resource.data.assignedEmployeeId))
+      );
+    }
+
+    // A valid claim: the lead was live and unassigned, and the write assigns it
+    // to the caller and moves it to `claimed`.
+    function isValidClaim() {
+      return resource.data.status == 'live' &&
+             resource.data.assignedEmployeeId == null &&
+             request.resource.data.assignedEmployeeId == request.auth.uid &&
+             request.resource.data.status == 'claimed';
+    }
+
+    // An employee working a lead they hold may move it along the pipeline and
+    // stamp activity, but never reassign it or rewrite its provenance.
+    function isValidLeadWork() {
+      return ownsLead() &&
+             unchanged('assignedEmployeeId') &&
+             unchanged('createdBy') &&
+             unchanged('publishedBy') &&
+             unchanged('createdAt') &&
+             unchanged('claimedAt');
+    }
+
+    match /leads/{leadId} {
+      allow read: if isSignedIn();
+
+      allow create: if isAdmin() ||
+                       (isActive() && isManager() &&
+                        request.resource.data.createdBy == request.auth.uid);
+
+      allow update: if isAdmin() ||
+                       (isActive() && managesLead()) ||
+                       (isActive() && isEmployee() &&
+                        (isValidClaim() || isValidLeadWork()));
+
+      allow delete: if isAdmin();
+    }
+
+    // ------------------------------- callLogs -------------------------------
+    //
+    // A call log is written by the rep who made the call, for themselves only,
+    // and is immutable afterwards — the call history is the audit trail the
+    // leaderboard is computed from.
+
+    match /callLogs/{callLogId} {
+      allow read: if isSignedIn();
+
+      allow create: if isActive() &&
+                       request.resource.data.employeeId == request.auth.uid;
+
+      // Nobody edits a call after the fact, not even its author.
+      allow update, delete: if isAdmin();
+    }
+
+    // ------------------------------- followUps ------------------------------
+
+    match /followUps/{followUpId} {
+      allow read: if isSignedIn();
+
+      allow create: if isActive() &&
+                       request.resource.data.employeeId == request.auth.uid;
+
+      // Only the owning rep completes or reschedules their own follow-up, and
+      // they cannot hand it to someone else.
+      allow update: if isAdmin() ||
+                       (isActive() &&
+                        resource.data.employeeId == request.auth.uid &&
+                        unchanged('employeeId') &&
+                        unchanged('leadId') &&
+                        unchanged('createdAt'));
+
+      allow delete: if isAdmin() ||
+                       (isActive() &&
+                        resource.data.employeeId == request.auth.uid);
+    }
+
+    // ------------------------------ attendance ------------------------------
+    //
+    // Attendance is readable across the workspace so a manager's team screen
+    // can show who has checked in today, but it stays self-recorded: no user
+    // can WRITE another user's attendance, because both the create and the
+    // update require the document's employeeId to be the caller's own uid.
+
+    match /attendance/{attendanceId} {
+      allow read: if isSignedIn();
+
+      allow create: if isActive() &&
+                       request.resource.data.employeeId == request.auth.uid;
+
+      allow update: if isAdmin() ||
+                       (isActive() &&
+                        resource.data.employeeId == request.auth.uid &&
+                        unchanged('employeeId') &&
+                        unchanged('date') &&
+                        unchanged('dateKey') &&
+                        unchanged('checkIn'));
+
+      allow delete: if isAdmin();
+    }
+
+    // -------------------------------- remarks -------------------------------
+
+    match /remarks/{remarkId} {
+      allow read: if isSignedIn();
+
+      allow create: if isActive() &&
+                       request.resource.data.authorId == request.auth.uid;
+
+      // Remarks are part of the lead's history; they are not edited in place.
+      allow update, delete: if isAdmin();
+    }
+
+    // ------------------------------ activities ------------------------------
+    //
+    // The timeline. Anyone signed in can read it (it is already scoped by the
+    // screens that show it), and an entry may only be written in the caller's
+    // own name — no forging someone else's action.
+
+    match /activities/{activityId} {
+      allow read: if isSignedIn();
+
+      allow create: if isActive() &&
+                       request.resource.data.userId == request.auth.uid;
+
+      allow update, delete: if isAdmin();
+    }
+
+    // ------------------------------ leaderboard -----------------------------
+    //
+    // Readable by every signed-in user, whatever their role. Scores are
+    // computed in the app from callLogs, followUps and leads; this collection
+    // is reserved as a cache for a future Cloud Function, and no ordinary user
+    // may write a score — least of all their own.
+
+    match /leaderboard/{entryId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // Anything not matched above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
